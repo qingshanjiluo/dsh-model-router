@@ -1,0 +1,14 @@
+{
+  "name": "dsh-model-router",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness 智能模型路由 — 任务分析、模型推荐、成本估算、性能对比",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": { ".": "./lib/index.js", "./client": "./lib/client.js", "./cordis.patch.yml": "./cordis.patch.yml", "./package.json": "./package.json" },
+  "scripts": { "build": "tsdown", "typecheck": "tsc --noEmit" },
+  "keywords": ["deepseek-harness", "dsh-plugin", "model-router", "ai-model", "routing"],
+  "license": "MIT",
+  "peerDependencies": { "@deepseek-ai/cordis": "*", "@deepseek-ai/dsh-tools": "*", "@deepseek-ai/dsh-client-runtime": "*", "@deepseek-ai/dsh-client-locale": "*", "@deepseek-ai/dsh-client-ui-settings": "*" },
+  "devDependencies": { "typescript": "^5.5.0", "tsdown": "^0.11.0" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" }, "client": { "platform": "web", "inject": ["@deepseek-ai/dsh-client-runtime", "@deepseek-ai/dsh-client-locale", "@deepseek-ai/dsh-client-ui-settings"] } }
+}

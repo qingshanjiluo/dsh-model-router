@@ -1,0 +1,5 @@
+- insert:
+    - id: model-router
+      name: dsh-model-router
+      config:
+        enabled: true
