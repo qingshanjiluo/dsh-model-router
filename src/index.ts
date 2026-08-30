@@ -221,9 +221,10 @@ export function apply(ctx: any, config: Config) {
       },
     },
     async execute(args: { task: string; prefer?: string }) {
-      if (args.prefer === 'speed') config.preferFree = false;
-      else if (args.prefer === 'cost') config.preferFree = true;
-      return recommendModels(args.task, config);
+      const cfg = { ...config };
+      if (args.prefer === 'speed') cfg.preferFree = false;
+      else if (args.prefer === 'cost') cfg.preferFree = true;
+      return recommendModels(args.task, cfg);
     },
   }), 'dsh-model-router: recommend');
 
