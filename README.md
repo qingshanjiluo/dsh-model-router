@@ -1,39 +1,86 @@
 # dsh-model-router
 
-> DeepSeek Harness 智能模型路由
+Deterministic model routing for DeepSeek Harness. The plugin ships a small static
+model catalog and exposes it to the model as three pure tools: recommend a model
+for a task, compare named models, and price a token budget. No network calls, no
+subprocesses, no provider registry — every answer comes from the embedded catalog
+and fixed arithmetic, so repeated calls return byte-identical results.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+Package: `@qingshanjiluo/dsh-model-router` · Type: host tool plugin (Cordis, `inject: ['tools']`)
 
-## ✨ 功能特性
-
-- 🧠 **智能推荐**: 根据任务类型自动推荐最佳模型（编码/推理/创作/翻译/视觉）
-- 📋 **模型数据库**: 内置 11+ 主流模型（DeepSeek/OpenAI/Anthropic/Google/Local）
-- ⚖️ **能力对比**: 多模型横向比较优缺点
-- 💰 **成本估算**: 预估 API 调用费用
-- 🎯 **任务分类**: 自动识别任务类型并匹配最优模型
-
-## 📦 安装
+## Install
 
 ```bash
-npm install dsh-model-router
+npx -y @deepseek-ai/dsh plugin --profile web add @qingshanjiluo/dsh-model-router
 ```
 
-## 🛠️ 工具
+## Tools
 
-| 工具名 | 描述 | 参数 |
-|--------|------|------|
-| `model_recommend` | 根据任务推荐最佳模型 | `task`(任务描述), `prefer`(偏好) |
-| `model_list` | 列出所有模型 | `provider`(提供商筛选) |
-| `model_compare` | 对比多个模型 | `models`(模型ID，逗号分隔) |
-| `model_cost` | 估算调用成本 | `model`, `input_tokens`, `output_tokens` |
+| Tool | Parameters | Returns |
+| --- | --- | --- |
+| `model_recommend` | `task` (`chat` \| `code` \| `analysis` \| `summarize` \| `agents` \| `vision`), `needVision` (boolean), `budget` (max USD per task, `0` = configured default) | Best-first `ranked` list with `score`, `estCostUsd`, `context`, `capabilities`, and per-dimension `reasons`; plus `considered`, every `excluded` model with its reason, and `notes`. |
+| `model_compare` | `ids` (array of model ids) | Resolved rows sorted by reference price (`context`, `costIn`, `costOut`, `refCostUsd`, `capabilities`), `winners` per dimension, `deltas` cost/context ratios, and `missing` ids. |
+| `model_cost` | `id`, `tokensIn`, `tokensOut` | `inputCostUsd` / `outputCostUsd` / `totalCostUsd` for exactly that workload, plus `contextTokens`, `fitsInContext`, and `notes`. Unknown id or negative tokens ⇒ `ok: false` with `error`. |
 
-## 📋 命令
+All three tools are concurrency-safe and validated against a declared output
+schema. Argument mistakes are rejected by the tool registry before the body runs.
 
-- `/model recommend <task>` — 推荐模型
-- `/model list [provider]` — 列出模型
-- `/model compare <m1,m2>` — 对比模型
-- `/model cost <model> <in> <out>` — 估算成本
+## How the score is built
 
-## 📄 License
+Each task kind carries a profile: required capabilities, a target context size, a
+typical token mix, and three weights.
+
+```
+score = w_capability * capabilityFit + w_cost * costFit + w_context * contextFit
+```
+
+* `capabilityFit` — share of the task's required capabilities the model has.
+* `costFit` — the model's price for the task's typical token mix, normalized
+  linearly across the surviving candidates (cheapest = 1).
+* `contextFit` — `min(1, context / targetContext)`.
+
+The score is rounded to 4 decimals and ties break on cheaper, then on catalog id,
+so rankings never depend on argument order or locale. `needVision: true` is a hard
+filter (non-vision models are excluded, not just penalized), as is `budget`.
+With `preferLowCost`, the cost weight doubles and the three weights renormalize.
+
+## Built-in catalog
+
+Prices are USD per 1 000 000 tokens. `model_compare` prices a fixed reference
+workload of 9000 input + 1000 output tokens so ratios stay comparable.
+
+| id | context | cost in /M | cost out /M | capabilities |
+| --- | --- | --- | --- | --- |
+| `deepseek-chat` | 128 000 | 0.27 | 1.10 | text, reasoning, tools, code |
+| `deepseek-reasoner` | 64 000 | 0.27 | 1.10 | text, reasoning, code |
+| `gpt-4o-mini` | 128 000 | 0.15 | 0.60 | text, vision, tools, code |
+| `gpt-4o` | 128 000 | 2.50 | 10.00 | text, vision, tools, code |
+| `claude-sonnet-4` | 200 000 | 3.00 | 15.00 | text, vision, reasoning, tools, code |
+| `claude-haiku-3.5` | 200 000 | 0.80 | 4.00 | text, vision, tools, code |
+| `gemini-flash` | 1 000 000 | 0.10 | 0.40 | text, vision, tools, code |
+| `llama-3.3-70b` | 128 000 | 0.60 | 0.60 | text, tools |
+| `qwen2.5-coder-32b` | 32 768 | 0 | 0 | text, code (self-hosted, unmetered) |
+
+Ids are matched case- and separator-insensitively (`GPT-4o-Mini` resolves).
+
+## Configuration
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `maxResults` | number | `5` | Ranked entries returned at most (clamped to `1..catalog size`). |
+| `defaultBudgetUsd` | number | `0` | Per-task USD ceiling applied when a call passes `budget: 0`; `0` = unlimited. |
+| `preferLowCost` | boolean | `false` | Double the cost dimension of the score, then renormalize the weights. |
+
+## Development
+
+```bash
+npm install --no-audit --no-fund
+npx tsc --noEmit          # types
+npm run build             # lib/index.js + lib/index.d.ts
+npx vitest run            # behavior tests (export face + >=2 cases per tool)
+node scripts/load-smoke.mjs   # loads lib/index.js and registers the tools
+```
+
+## License
 
 MIT

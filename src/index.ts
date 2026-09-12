@@ -1,351 +1,626 @@
 /**
- * dsh-model-router — 智能模型路由
- *
- * 功能：
- * 1. 任务分析：根据任务类型推荐最佳模型
- * 2. 模型数据库：内置主流模型能力/价格/速度数据
- * 3. 成本估算：预估 API 调用费用
- * 4. 性能对比：多模型能力横向比较
- * 5. 路由建议：根据需求（速度/质量/成本）给出推荐
- * 6. 使用统计：追踪模型调用历史
+ * Deterministic model router for DeepSeek Harness. Three pure tools rank a
+ * built-in static catalog: `model_recommend` scores every model for a task kind
+ * (capability fit + cost fit + context fit), `model_compare` puts named models
+ * side by side and picks per-dimension winners, and `model_cost` prices one
+ * token budget. The catalog ships inside the plugin, so there is no network
+ * call, subprocess, or live provider registry anywhere in this file.
+ * @module @qingshanjiluo/dsh-model-router
  */
 
-import { z } from 'zod';
+import type { Context } from '@deepseek-ai/cordis'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import z from '@deepseek-ai/schemastery'
 
-export const name = 'dsh-model-router';
-export const inject = ['settings', 'tools', 'commands'];
+export const name = 'dsh-model-router'
+export const inject = ['tools']
 
-const configSchema = z.object({
-  enabled: z.boolean().default(true),
-  preferFree: z.boolean().default(false),
-  maxCostPerTask: z.number().min(0).default(0.1),
-  defaultProvider: z.enum(['deepseek', 'openai', 'anthropic', 'google', 'auto']).default('auto'),
-});
-
-type Config = z.infer<typeof configSchema>;
-
-// ==================== 模型数据库 ====================
-
-interface ModelInfo {
-  id: string;
-  name: string;
-  provider: string;
-  family: string;
-  contextWindow: number;
-  maxOutput: number;
-  inputPrice: number;   // per 1M tokens
-  outputPrice: number;
-  speed: 'fast' | 'medium' | 'slow';
-  coding: number;       // 1-10
-  reasoning: number;
-  creative: number;
-  multilingual: number;
-  vision: boolean;
-  functionCalling: boolean;
-  openSource: boolean;
+/** Deployment policy for the router. */
+export interface Config {
+  /**
+   * How many ranked entries `model_recommend` returns at most. Clamped to
+   * `[1, catalog size]` at call time.
+   */
+  maxResults: number
+  /**
+   * USD ceiling per task applied when a call passes `budget: 0`. `0` means no
+   * budget limit.
+   */
+  defaultBudgetUsd: number
+  /** Double the cost dimension of the score, then renormalize the weights. */
+  preferLowCost: boolean
 }
 
-const MODELS: ModelInfo[] = [
-  // DeepSeek
-  { id: 'deepseek-chat', name: 'DeepSeek-V3', provider: 'deepseek', family: 'deepseek-v3', contextWindow: 65536, maxOutput: 8192, inputPrice: 0.27, outputPrice: 1.10, speed: 'fast', coding: 8, reasoning: 8, creative: 7, multilingual: 8, vision: false, functionCalling: true, openSource: true },
-  { id: 'deepseek-reasoner', name: 'DeepSeek-R1', provider: 'deepseek', family: 'deepseek-r1', contextWindow: 65536, maxOutput: 8192, inputPrice: 0.55, outputPrice: 2.19, speed: 'medium', coding: 9, reasoning: 10, creative: 7, multilingual: 8, vision: false, functionCalling: false, openSource: true },
-  // OpenAI
-  { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', family: 'gpt-4o', contextWindow: 128000, maxOutput: 16384, inputPrice: 2.50, outputPrice: 10.00, speed: 'medium', coding: 9, reasoning: 9, creative: 9, multilingual: 9, vision: true, functionCalling: true, openSource: false },
-  { id: 'gpt-4o-mini', name: 'GPT-4o Mini', provider: 'openai', family: 'gpt-4o-mini', contextWindow: 128000, maxOutput: 16384, inputPrice: 0.15, outputPrice: 0.60, speed: 'fast', coding: 7, reasoning: 7, creative: 7, multilingual: 8, vision: true, functionCalling: true, openSource: false },
-  { id: 'o1', name: 'o1', provider: 'openai', family: 'o1', contextWindow: 200000, maxOutput: 100000, inputPrice: 15.00, outputPrice: 60.00, speed: 'slow', coding: 10, reasoning: 10, creative: 8, multilingual: 9, vision: true, functionCalling: false, openSource: false },
-  // Anthropic
-  { id: 'claude-sonnet-4', name: 'Claude Sonnet 4', provider: 'anthropic', family: 'claude-4', contextWindow: 200000, maxOutput: 64000, inputPrice: 3.00, outputPrice: 15.00, speed: 'medium', coding: 9, reasoning: 9, creative: 9, multilingual: 9, vision: true, functionCalling: true, openSource: false },
-  { id: 'claude-3-5-sonnet', name: 'Claude 3.5 Sonnet', provider: 'anthropic', family: 'claude-3.5', contextWindow: 200000, maxOutput: 8192, inputPrice: 3.00, outputPrice: 15.00, speed: 'medium', coding: 9, reasoning: 8, creative: 9, multilingual: 9, vision: true, functionCalling: true, openSource: false },
-  // Google
-  { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', provider: 'google', family: 'gemini-2.5', contextWindow: 1000000, maxOutput: 65536, inputPrice: 1.25, outputPrice: 10.00, speed: 'medium', coding: 9, reasoning: 9, creative: 8, multilingual: 9, vision: true, functionCalling: true, openSource: false },
-  { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', provider: 'google', family: 'gemini-2.0', contextWindow: 1000000, maxOutput: 8192, inputPrice: 0.10, outputPrice: 0.40, speed: 'fast', coding: 7, reasoning: 7, creative: 7, multilingual: 8, vision: true, functionCalling: true, openSource: false },
-  // 本地/开源
-  { id: 'qwen-2.5-72b', name: 'Qwen 2.5 72B', provider: 'local', family: 'qwen-2.5', contextWindow: 131072, maxOutput: 8192, inputPrice: 0, outputPrice: 0, speed: 'fast', coding: 8, reasoning: 8, creative: 7, multilingual: 8, vision: false, functionCalling: false, openSource: true },
-  { id: 'llama-3.1-70b', name: 'Llama 3.1 70B', provider: 'local', family: 'llama-3.1', contextWindow: 131072, maxOutput: 4096, inputPrice: 0, outputPrice: 0, speed: 'fast', coding: 7, reasoning: 7, creative: 7, multilingual: 6, vision: false, functionCalling: false, openSource: true },
-];
+/** Schemastery configuration for the router. */
+export const Config: z<Config> = z.object({
+  maxResults: z.number().default(5),
+  defaultBudgetUsd: z.number().default(0),
+  preferLowCost: z.boolean().default(false),
+})
 
-// ==================== 任务分类 ====================
+/* ------------------------------------------------------------------- catalog */
 
-type TaskType = 'coding' | 'reasoning' | 'creative' | 'translation' | 'analysis' | 'chat' | 'vision' | 'function_call';
+const CAPABILITIES = ['text', 'vision', 'reasoning', 'tools', 'code'] as const
+type Capability = (typeof CAPABILITIES)[number]
 
-function classifyTask(description: string): TaskType {
-  const lower = description.toLowerCase();
-  if (/代码|编程|debug|fix|refactor|test|代码审查|code|implement|bug|修复/.test(lower)) return 'coding';
-  if (/推理|逻辑|数学|计算|分析|证明|分析问题|reason|logic|math/.test(lower)) return 'reasoning';
-  if (/写作|创作|文章|故事|诗|文案|创意|creative|write|story|blog/.test(lower)) return 'creative';
-  if (/翻译|translate|多语言|语言转换/.test(lower)) return 'translation';
-  if (/分析|总结|摘要|summarize|analyze|数据|报告/.test(lower)) return 'analysis';
-  if (/图片|图像|视觉|截图|photo|image|vision|ocr/.test(lower)) return 'vision';
-  if (/工具|函数|api|调用|工具使用|function|tool|plugin/.test(lower)) return 'function_call';
-  return 'chat';
+/** One catalog row. `costIn`/`costOut` are USD per 1 000 000 tokens. */
+interface ModelEntry {
+  readonly id: string
+  readonly context: number
+  readonly costIn: number
+  readonly costOut: number
+  readonly capabilities: readonly Capability[]
 }
 
-// ==================== 模型推荐引擎 ====================
+/** Built-in static catalog. Self-hosted rows carry 0 pricing by design. */
+const CATALOG: readonly ModelEntry[] = [
+  { id: 'deepseek-chat', context: 128_000, costIn: 0.27, costOut: 1.1, capabilities: ['text', 'reasoning', 'tools', 'code'] },
+  { id: 'deepseek-reasoner', context: 64_000, costIn: 0.27, costOut: 1.1, capabilities: ['text', 'reasoning', 'code'] },
+  { id: 'gpt-4o-mini', context: 128_000, costIn: 0.15, costOut: 0.6, capabilities: ['text', 'vision', 'tools', 'code'] },
+  { id: 'gpt-4o', context: 128_000, costIn: 2.5, costOut: 10, capabilities: ['text', 'vision', 'tools', 'code'] },
+  { id: 'claude-sonnet-4', context: 200_000, costIn: 3, costOut: 15, capabilities: ['text', 'vision', 'reasoning', 'tools', 'code'] },
+  { id: 'claude-haiku-3.5', context: 200_000, costIn: 0.8, costOut: 4, capabilities: ['text', 'vision', 'tools', 'code'] },
+  { id: 'gemini-flash', context: 1_000_000, costIn: 0.1, costOut: 0.4, capabilities: ['text', 'vision', 'tools', 'code'] },
+  { id: 'llama-3.3-70b', context: 128_000, costIn: 0.6, costOut: 0.6, capabilities: ['text', 'tools'] },
+  { id: 'qwen2.5-coder-32b', context: 32_768, costIn: 0, costOut: 0, capabilities: ['text', 'code'] },
+]
 
-function scoreModel(model: ModelInfo, taskType: TaskType, config: Config): number {
-  let score = 0;
+/** Catalog ids in declared order — reused for "did you mean" hints. */
+const CATALOG_IDS: readonly string[] = CATALOG.map(model => model.id)
 
-  // 基础能力得分
-  switch (taskType) {
-    case 'coding': score = model.coding * 10; break;
-    case 'reasoning': score = model.reasoning * 10; break;
-    case 'creative': score = model.creative * 10; break;
-    case 'translation': score = model.multilingual * 10; break;
-    case 'analysis': score = (model.reasoning + model.coding) * 5; break;
-    case 'vision': score = model.vision ? 90 : 0; break;
-    case 'function_call': score = model.functionCalling ? 90 : 10; break;
-    case 'chat': score = (model.coding + model.reasoning + model.creative) * 3; break;
+/** Declared catalog position, so tie-breaks never depend on caller argument order. */
+const CATALOG_ORDER = new Map<string, number>(CATALOG.map((model, index) => [model.id, index]))
+
+/** Reference workload for `model_compare`: 9000 input + 1000 output tokens. */
+const REF_TOKENS_IN = 9_000
+const REF_TOKENS_OUT = 1_000
+
+/**
+ * Resolve a caller-supplied id, tolerating case and separator differences so a
+ * model writing `GPT-4o-Mini` still hits the catalog row.
+ * @param raw - the id as supplied by the caller.
+ * @returns the catalog row, or undefined when nothing matches.
+ */
+function findModel(raw: string): ModelEntry | undefined {
+  const exact = CATALOG.find(model => model.id === raw)
+  if (exact !== undefined) return exact
+  const key = raw.trim().toLowerCase().replace(/[\s_.]+/g, '-')
+  return CATALOG.find(model => model.id.toLowerCase() === key)
+}
+
+/** ICU-independent ascending id comparator, so ranks never depend on locale. */
+function byIdAsc(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0
+}
+
+/* ------------------------------------------------------------- task profiles */
+
+const TASKS = ['chat', 'code', 'analysis', 'summarize', 'agents', 'vision'] as const
+type TaskKind = (typeof TASKS)[number]
+
+/** Deterministic shape of one task kind: needs, typical size, score weights. */
+interface TaskProfile {
+  readonly required: readonly Capability[]
+  readonly minContext: number
+  readonly inputTokens: number
+  readonly outputTokens: number
+  readonly capability: number
+  readonly cost: number
+  readonly context: number
+}
+
+const TASK_PROFILES: Record<TaskKind, TaskProfile> = {
+  chat: { required: ['text'], minContext: 8_192, inputTokens: 800, outputTokens: 600, capability: 0.4, cost: 0.4, context: 0.2 },
+  code: { required: ['text', 'code'], minContext: 32_768, inputTokens: 6_000, outputTokens: 2_500, capability: 0.5, cost: 0.3, context: 0.2 },
+  analysis: { required: ['text', 'reasoning'], minContext: 64_000, inputTokens: 40_000, outputTokens: 4_000, capability: 0.5, cost: 0.25, context: 0.25 },
+  summarize: { required: ['text'], minContext: 128_000, inputTokens: 100_000, outputTokens: 2_000, capability: 0.3, cost: 0.4, context: 0.3 },
+  agents: { required: ['text', 'tools'], minContext: 64_000, inputTokens: 20_000, outputTokens: 2_000, capability: 0.5, cost: 0.3, context: 0.2 },
+  vision: { required: ['text', 'vision'], minContext: 16_384, inputTokens: 3_000, outputTokens: 800, capability: 0.5, cost: 0.3, context: 0.2 },
+}
+
+/* ------------------------------------------------------------------ numerics */
+
+/** Round to a fixed number of decimals so scores are byte-stable. */
+function round(value: number, digits: number): number {
+  if (!Number.isFinite(value)) return 0
+  const factor = 10 ** digits
+  const scaled = Math.round(value * factor) / factor
+  return Object.is(scaled, -0) ? 0 : scaled
+}
+
+/** USD price of an explicit token budget (catalog prices are per 1M tokens). */
+function price(model: ModelEntry, tokensIn: number, tokensOut: number): { input: number; output: number; total: number } {
+  const input = (Math.max(0, tokensIn) / 1_000_000) * model.costIn
+  const output = (Math.max(0, tokensOut) / 1_000_000) * model.costOut
+  return { input: round(input, 6), output: round(output, 6), total: round(input + output, 6) }
+}
+
+/** `$0.013500` text for a USD amount. */
+function usd(value: number): string {
+  return `$${Math.max(0, value).toFixed(6)}`
+}
+
+/* ----------------------------------------------------------------- scoring */
+
+interface RankedEntry {
+  readonly id: string
+  readonly score: number
+  readonly estCostUsd: number
+  readonly context: number
+  readonly capabilities: readonly string[]
+  readonly reasons: readonly string[]
+}
+
+interface ScorePass {
+  readonly ranked: RankedEntry[]
+  readonly excluded: readonly { id: string; reason: string }[]
+  readonly considered: number
+}
+
+/**
+ * Filter then score the whole catalog for one task profile.
+ *
+ * Filters (in order): the `needVision` capability requirement, then the
+ * per-task budget ceiling. Score is a weighted sum of capability fit, cost fit
+ * (linearly normalized across the surviving set), and context fit, rounded to
+ * 4 decimals; ties break on cheaper, then on id.
+ *
+ * @param profile - the task profile being matched.
+ * @param needVision - hard-require the `vision` capability.
+ * @param budgetUsd - per-task ceiling; `0` disables the budget filter.
+ * @param preferLowCost - double the cost weight, then renormalize.
+ * @returns best-first ranking, every exclusion with its reason, and the size of the surviving set.
+ */
+function scoreCatalog(profile: TaskProfile, needVision: boolean, budgetUsd: number, preferLowCost: boolean): ScorePass {
+  const required: readonly Capability[] = needVision && !profile.required.includes('vision')
+    ? [...profile.required, 'vision' as Capability]
+    : profile.required
+
+  const excluded: { id: string; reason: string }[] = []
+
+  const candidates: ModelEntry[] = []
+  for (const model of CATALOG) {
+    if (needVision && !model.capabilities.includes('vision')) {
+      excluded.push({ id: model.id, reason: 'no vision capability' })
+      continue
+    }
+    candidates.push(model)
   }
 
-  // 速度加分
-  if (model.speed === 'fast') score += 10;
-  else if (model.speed === 'medium') score += 5;
+  const estimates = new Map<string, number>()
+  for (const model of candidates) estimates.set(model.id, price(model, profile.inputTokens, profile.outputTokens).total)
 
-  // 成本惩罚
-  if (config.preferFree && model.inputPrice === 0) score += 20;
-  if (model.inputPrice > config.maxCostPerTask * 1000) score -= 15;
+  const surviving: ModelEntry[] = []
+  for (const model of candidates) {
+    const est = estimates.get(model.id)!
+    if (budgetUsd > 0 && est > budgetUsd) {
+      excluded.push({ id: model.id, reason: `${usd(est)} for this task exceeds the ${usd(budgetUsd)} budget` })
+      continue
+    }
+    surviving.push(model)
+  }
+  if (surviving.length === 0) return { ranked: [], excluded, considered: 0 }
 
-  // 上下文窗口
-  if (model.contextWindow >= 100000) score += 5;
+  let cheapest = Infinity
+  let dearest = -Infinity
+  for (const model of surviving) {
+    const est = estimates.get(model.id)!
+    if (est < cheapest) cheapest = est
+    if (est > dearest) dearest = est
+  }
 
-  // 开源加分
-  if (model.openSource) score += 3;
+  const rawCap = profile.capability
+  const rawCost = preferLowCost ? profile.cost * 2 : profile.cost
+  const rawCtx = profile.context
+  const rawSum = rawCap + rawCost + rawCtx || 1
+  const wCap = rawCap / rawSum
+  const wCost = rawCost / rawSum
+  const wCtx = rawCtx / rawSum
 
-  return score;
+  const ranked: RankedEntry[] = []
+  for (const model of surviving) {
+    const est = estimates.get(model.id)!
+    const missing = required.filter(cap => !model.capabilities.includes(cap))
+    const capScore = required.length === 0 ? 1 : (required.length - missing.length) / required.length
+    const costScore = dearest - cheapest <= 0 ? 1 : (dearest - est) / (dearest - cheapest)
+    const ctxScore = Math.min(1, model.context / profile.minContext)
+    const reasons: string[] = [
+      `est. ${usd(est)} for ${profile.inputTokens} in + ${profile.outputTokens} out`,
+      missing.length === 0
+        ? `has ${required.join(' + ')}`
+        : `missing ${missing.join(', ')}`,
+      model.context >= profile.minContext
+        ? `context ${model.context} covers the ${profile.minContext} target`
+        : `context ${model.context} below the ${profile.minContext} target`,
+    ]
+    if (model.costIn === 0 && model.costOut === 0) reasons.push('self-hosted: token prices are 0')
+    ranked.push({
+      id: model.id,
+      score: round(wCap * capScore + wCost * costScore + wCtx * ctxScore, 4),
+      estCostUsd: est,
+      context: model.context,
+      capabilities: [...model.capabilities],
+      reasons,
+    })
+  }
+
+  ranked.sort((a, b) => b.score - a.score || a.estCostUsd - b.estCostUsd || byIdAsc(a.id, b.id))
+  return { ranked, excluded, considered: surviving.length }
 }
 
-function recommendModels(taskDescription: string, config: Config): { model: ModelInfo; score: number; reason: string }[] {
-  const taskType = classifyTask(taskDescription);
-
-  const scored = MODELS.map(model => ({
-    model,
-    score: scoreModel(model, taskType, config),
-    reason: getRecommendationReason(model, taskType),
-  }));
-
-  scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, 5);
+/** Clamp the operator's `maxResults` into a usable slice length. */
+function clampMax(value: number, size: number): number {
+  const n = Number.isFinite(value) ? Math.floor(value) : 5
+  return Math.min(Math.max(1, n), size)
 }
 
-function getRecommendationReason(model: ModelInfo, taskType: TaskType): string {
-  const reasons: string[] = [];
-  if (model.vision && taskType === 'vision') reasons.push('支持视觉理解');
-  if (model.functionCalling && taskType === 'function_call') reasons.push('支持函数调用');
-  if (model.speed === 'fast') reasons.push('响应速度快');
-  if (model.inputPrice === 0) reasons.push('免费/开源');
-  if (model.contextWindow >= 100000) reasons.push('大上下文窗口');
-  if (model.coding >= 9) reasons.push('编码能力顶尖');
-  if (model.reasoning >= 9) reasons.push('推理能力顶尖');
-  if (model.openSource) reasons.push('开源模型');
-  return reasons.join('、') || '综合表现良好';
-}
+/* -------------------------------------------------------------------- tools */
 
-// ==================== 成本估算 ====================
-
-function estimateCost(model: ModelInfo, inputTokens: number, outputTokens: number): { inputCost: number; outputCost: number; totalCost: number; formatted: string } {
-  const inputCost = (inputTokens / 1_000_000) * model.inputPrice;
-  const outputCost = (outputTokens / 1_000_000) * model.outputPrice;
-  const totalCost = inputCost + outputCost;
-  return {
-    inputCost,
-    outputCost,
-    totalCost,
-    formatted: totalCost === 0 ? '免费' : `$${totalCost.toFixed(6)}`,
-  };
-}
-
-// ==================== 对比分析 ====================
-
-function compareModels(modelIds: string[]): { model: ModelInfo; strengths: string[]; weaknesses: string[] }[] {
-  return modelIds.map(id => {
-    const model = MODELS.find(m => m.id === id || m.name.toLowerCase().includes(id.toLowerCase()));
-    if (!model) return null;
-
-    const strengths: string[] = [];
-    const weaknesses: string[] = [];
-
-    if (model.coding >= 9) strengths.push('编码能力顶尖');
-    else if (model.coding <= 6) weaknesses.push('编码能力较弱');
-    if (model.reasoning >= 9) strengths.push('推理能力顶尖');
-    else if (model.reasoning <= 6) weaknesses.push('推理能力较弱');
-    if (model.creative >= 9) strengths.push('创意写作出色');
-    if (model.vision) strengths.push('支持视觉理解');
-    if (model.functionCalling) strengths.push('支持函数调用');
-    if (model.speed === 'fast') strengths.push('响应速度快');
-    if (model.speed === 'slow') weaknesses.push('响应速度较慢');
-    if (model.inputPrice === 0) strengths.push('免费使用');
-    if (model.inputPrice > 10) weaknesses.push('价格较高');
-    if (model.openSource) strengths.push('开源可部署');
-
-    return { model, strengths, weaknesses };
-  }).filter(Boolean) as any;
-}
-
-// ==================== 模型列表 ====================
-
-function listAllModels(): ModelInfo[] {
-  return MODELS;
-}
-
-function getModelById(id: string): ModelInfo | undefined {
-  return MODELS.find(m => m.id === id || m.name.toLowerCase().includes(id.toLowerCase()));
-}
-
-// ==================== 插件入口 ====================
-
-export function apply(ctx: any, config: Config) {
-  if (!config.enabled) return;
-
-  // model_recommend — 推荐模型
-  ctx.effect(() => ctx.tools.register({
+/**
+ * Register the router tools on `ctx.tools`.
+ * @param ctx - registrant context carrying the tool registry.
+ * @param config - deployment's explicit routing policy.
+ */
+export function apply(ctx: Context, config: Config): void {
+  ctx.tools.register(defineTool({
     name: 'model_recommend',
-    description: '根据任务描述智能推荐最佳 AI 模型。分析任务类型，从速度、质量、成本多维度评分排序。',
+    description:
+      'Rank the built-in static model catalog for one task kind, best first, with ' +
+      'a deterministic score = capability fit + cost fit + context fit (weights ' +
+      'come from the task profile). Parameters: task is one of "chat" (general ' +
+      'Q&A), "code" (writing/refactoring code), "analysis" (long multi-step ' +
+      'reasoning), "summarize" (very large input), "agents" (tool-using loops), ' +
+      '"vision" (image input); needVision=true hard-requires image input and ' +
+      'drops non-vision models; budget is the max USD per task and drops anything ' +
+      'priced above it — pass 0 to fall back to the configured default (0 = no ' +
+      'limit). Every dropped model is reported under `excluded` with its reason.',
     parameters: {
-      task: { type: 'string', description: '任务描述（如：帮我修复一个 React 的类型错误、写一篇技术博客）' },
-      prefer: { type: 'string', description: '偏好：speed（速度优先）| quality（质量优先）| cost（成本优先）' },
+      task: { type: 'string', required: true, enum: [...TASKS], description: 'Task kind selecting the capability needs, typical token mix, and score weights.' },
+      needVision: { type: 'boolean', required: true, description: 'True to require image input and exclude models without vision.' },
+      budget: { type: 'number', required: true, description: 'Max USD per task; models priced above it are excluded. 0 = use the configured default (0 = unlimited).' },
     },
     output: {
-      schema: { type: 'json' },
-      render(_args: unknown, value: unknown) {
-        const results = value as { model: ModelInfo; score: number; reason: string }[];
-        if (results.length === 0) return [{ type: 'text', text: '没有找到合适的模型' }];
-        const lines = ['## 🤖 推荐模型'];
-        for (const [i, r] of results.entries()) {
-          const icon = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '  ';
-          const price = r.model.inputPrice === 0 ? '免费' : `$${r.model.inputPrice}/1M in`;
-          lines.push(`${icon} **${r.model.name}** (${r.model.provider}) — 评分: ${r.score}`);
-          lines.push(`  价格: ${price} | 速度: ${r.model.speed} | 上下文: ${(r.model.contextWindow / 1000).toFixed(0)}K`);
-          lines.push(`  推荐理由: ${r.reason}`);
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true, description: 'Whether at least one model survived the filters.' },
+          task: { type: 'string', required: true, description: 'The task profile that was applied.' },
+          budgetUsd: { type: 'number', required: true, description: 'Effective USD-per-task ceiling after defaults; 0 = unlimited.' },
+          considered: { type: 'integer', required: true, description: 'Catalog models that passed every filter and were scored.' },
+          ranked: {
+            type: 'array',
+            required: true,
+            description: 'Best first, truncated to the configured maxResults.',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                id: { type: 'string', required: true, description: 'Catalog model id.' },
+                score: { type: 'number', required: true, description: 'Composite score in [0,1]; higher is better.' },
+                estCostUsd: { type: 'number', required: true, description: 'Estimated USD for this task profile\'s typical token mix.' },
+                context: { type: 'integer', required: true, description: 'Context window in tokens.' },
+                capabilities: { type: 'array', required: true, description: 'Capability tags of this model.', items: { type: 'string' } },
+                reasons: {
+                  type: 'array',
+                  required: true,
+                  description: 'Deterministic justification lines, one per scored dimension.',
+                  items: { type: 'string' },
+                },
+              },
+            },
+          },
+          excluded: {
+            type: 'array',
+            required: true,
+            description: 'Every model dropped before scoring, with its reason.',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                id: { type: 'string', required: true, description: 'Catalog model id.' },
+                reason: { type: 'string', required: true, description: 'Why it was dropped.' },
+              },
+            },
+          },
+          notes: { type: 'array', required: true, description: 'Advisories; empty in the normal case.', items: { type: 'string' } },
+        },
+      },
+      render: (_args, value) => {
+        if (value.ranked.length === 0) {
+          const why = value.notes.length > 0 ? value.notes.join('; ') : `${value.excluded.length} model(s) excluded`
+          return [{ type: 'text', text: `model_recommend("${value.task}"): no model fits — ${why}` }]
         }
-        return [{ type: 'text', text: lines.join('\n') }];
+        const head = `Task "${value.task}" — ${value.considered} candidate(s), budget ${value.budgetUsd > 0 ? usd(value.budgetUsd) : 'none'}:`
+        const lines = value.ranked.map((entry, index) =>
+          `${index + 1}. ${entry.id}  score=${entry.score.toFixed(4)}  est=${usd(entry.estCostUsd)}  ctx=${entry.context}  [${entry.capabilities.join(', ')}]`)
+        const parts = [head, ...lines]
+        if (value.excluded.length > 0) parts.push(`excluded: ${value.excluded.map(e => `${e.id} (${e.reason})`).join('; ')}`)
+        if (value.notes.length > 0) parts.push(`note: ${value.notes.join('; ')}`)
+        return [{ type: 'text', text: parts.join('\n') }]
       },
     },
-    async execute(args: { task: string; prefer?: string }) {
-      const cfg = { ...config };
-      if (args.prefer === 'speed') cfg.preferFree = false;
-      else if (args.prefer === 'cost') cfg.preferFree = true;
-      return recommendModels(args.task, cfg);
-    },
-  }), 'dsh-model-router: recommend');
+    isConcurrencySafe: () => true,
+    execute(args) {
+      const profile = TASK_PROFILES[args.task] ?? TASK_PROFILES.chat
+      const budgetUsd = args.budget > 0 ? args.budget : Math.max(0, config.defaultBudgetUsd)
+      const { ranked, excluded, considered } = scoreCatalog(profile, args.needVision, budgetUsd, config.preferLowCost)
+      const limit = clampMax(config.maxResults, CATALOG.length)
+      const visible = ranked.slice(0, limit)
 
-  // model_list — 列出所有模型
-  ctx.effect(() => ctx.tools.register({
-    name: 'model_list',
-    description: '列出所有支持的 AI 模型及其能力、价格、速度信息。',
-    parameters: {
-      provider: { type: 'string', description: '筛选特定提供商（deepseek/openai/anthropic/google/local）' },
-    },
-    output: {
-      schema: { type: 'json' },
-      render(_args: unknown, value: unknown) {
-        const models = value as ModelInfo[];
-        const lines = [`## 📋 模型列表 (${models.length})`];
-        for (const m of models) {
-          const price = m.inputPrice === 0 ? '免费' : `$${m.inputPrice}`;
-          lines.push(`- **${m.name}** (${m.id}) — ${m.provider}`);
-          lines.push(`  编码:${m.coding} 推理:${m.reasoning} 创意:${m.creative} 多语言:${m.multilingual}`);
-          lines.push(`  价格: ${price} | 速度: ${m.speed} | 上下文: ${(m.contextWindow / 1000).toFixed(0)}K | 视觉: ${m.vision ? '✓' : '✗'}`);
-        }
-        return [{ type: 'text', text: lines.join('\n') }];
-      },
-    },
-    async execute(args: { provider?: string }) {
-      if (args.provider) return MODELS.filter(m => m.provider === args.provider);
-      return MODELS;
-    },
-  }), 'dsh-model-router: list');
-
-  // model_compare — 模型对比
-  ctx.effect(() => ctx.tools.register({
-    name: 'model_compare',
-    description: '对比多个模型的能力、优缺点、价格。',
-    parameters: {
-      models: { type: 'string', description: '模型 ID，逗号分隔（如 gpt-4o,claude-sonnet-4,deepseek-chat）' },
-    },
-    output: {
-      schema: { type: 'json' },
-      render(_args: unknown, value: unknown) {
-        const results = value as { model: ModelInfo; strengths: string[]; weaknesses: string[] }[];
-        if (results.length === 0) return [{ type: 'text', text: '未找到指定模型' }];
-        const lines = ['## ⚖️ 模型对比'];
-        for (const r of results) {
-          lines.push(`### ${r.model.name} (${r.model.provider})`);
-          lines.push(`编码: ${r.model.coding}/10 | 推理: ${r.model.reasoning}/10 | 创意: ${r.model.creative}/10`);
-          lines.push(`价格: $${r.model.inputPrice}/$${r.model.outputPrice} | 速度: ${r.model.speed} | 上下文: ${(r.model.contextWindow / 1000).toFixed(0)}K`);
-          if (r.strengths.length) lines.push(`优势: ${r.strengths.join('、')}`);
-          if (r.weaknesses.length) lines.push(`劣势: ${r.weaknesses.join('、')}`);
-        }
-        return [{ type: 'text', text: lines.join('\n') }];
-      },
-    },
-    async execute(args: { models: string }) {
-      const ids = args.models.split(',').map(s => s.trim());
-      return compareModels(ids);
-    },
-  }), 'dsh-model-router: compare');
-
-  // model_cost — 成本估算
-  ctx.effect(() => ctx.tools.register({
-    name: 'model_cost',
-    description: '估算特定模型的 API 调用成本。',
-    parameters: {
-      model: { type: 'string', description: '模型 ID 或名称' },
-      input_tokens: { type: 'number', description: '预计输入 token 数' },
-      output_tokens: { type: 'number', description: '预计输出 token 数' },
-    },
-    output: {
-      schema: { type: 'json' },
-      render(_args: unknown, value: unknown) {
-        const cost = value as any;
-        return [{ type: 'text', text: `## 💰 成本估算\n模型: ${cost.model?.name || '未知'}\n输入: $${cost.inputCost?.toFixed(6)} | 输出: $${cost.outputCost?.toFixed(6)}\n总计: **${cost.formatted}**` }];
-      },
-    },
-    async execute(args: { model: string; input_tokens: number; output_tokens: number }) {
-      const model = getModelById(args.model);
-      if (!model) throw new Error(`未找到模型: ${args.model}`);
-      return { ...estimateCost(model, args.input_tokens, args.output_tokens), model };
-    },
-  }), 'dsh-model-router: cost');
-
-  // slash 命令 /model
-  ctx.effect(() => ctx.commands.register({
-    name: 'model',
-    description: '智能模型路由',
-    input: { hint: 'recommend <task> | list [provider] | compare <model1,model2> | cost <model> <tokens>' },
-    async handler(invocation: any) {
-      const parts = invocation.rawInput.trim().split(/\s+/).filter(Boolean);
-      if (parts.length === 0) return { kind: 'text', text: '用法: /model recommend <task> | list | compare <models> | cost <model> <in_tokens> <out_tokens>' };
-      const cmd = parts[0];
-      switch (cmd) {
-        case 'recommend': {
-          const task = parts.slice(1).join(' ');
-          if (!task) return { kind: 'text', text: '请描述任务' };
-          const results = recommendModels(task, config);
-          return { kind: 'text', text: results.map((r, i) => `${i + 1}. ${r.model.name} (${r.model.provider}) — ${r.reason}`).join('\n') };
-        }
-        case 'list': {
-          const models = parts[1] ? MODELS.filter(m => m.provider === parts[1]) : MODELS;
-          return { kind: 'text', text: models.map(m => `${m.name} (${m.provider}) — 编码:${m.coding} 推理:${m.reasoning}`).join('\n') };
-        }
-        case 'compare': {
-          const ids = parts[1]?.split(',') || [];
-          const results = compareModels(ids);
-          return { kind: 'text', text: results.map(r => `${r.model.name}: ${r.strengths.join('、')}`).join('\n') };
-        }
-        case 'cost': {
-          const model = getModelById(parts[1] || '');
-          if (!model) return { kind: 'text', text: `未找到模型: ${parts[1]}` };
-          const cost = estimateCost(model, Number(parts[2]) || 0, Number(parts[3]) || 0);
-          return { kind: 'text', text: `${model.name}: ${cost.formatted}` };
-        }
-        default: return { kind: 'text', text: `未知命令: ${cmd}` };
+      const notes: string[] = []
+      if (ranked.length === 0) {
+        notes.push(budgetUsd > 0
+          ? `no catalog model stays under the ${usd(budgetUsd)} per-task budget`
+          : 'no catalog model survived the filters')
+      } else if (ranked.length > visible.length) {
+        notes.push(`showing ${visible.length} of ${ranked.length} scored models (maxResults=${limit})`)
       }
-    },
-  }), 'dsh-model-router: command');
+      if (budgetUsd === 0 && config.preferLowCost) notes.push('preferLowCost is on: the cost dimension is doubled')
 
-  // 设置注册
-  ctx.inject(['settings'], (sctx: any) => {
-    const { settingsNamespace } = require('@deepseek-ai/dsh-settings');
-    sctx.settings.register(settingsNamespace('model-router'), configSchema, { base: config, expose: true, applies: 'live' });
-  });
+      return Promise.resolve({
+        ok: ranked.length > 0,
+        task: args.task,
+        budgetUsd: round(budgetUsd, 6),
+        considered,
+        ranked: visible.map(entry => ({
+          id: entry.id,
+          score: entry.score,
+          estCostUsd: entry.estCostUsd,
+          context: entry.context,
+          capabilities: [...entry.capabilities],
+          reasons: [...entry.reasons],
+        })),
+        excluded: excluded.map(entry => ({ id: entry.id, reason: entry.reason })),
+        notes,
+      })
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'model_compare',
+    description:
+      'Compare named models from the built-in catalog side by side. Parameters: ' +
+      'ids is the list to contrast, for example ["deepseek-chat", "gpt-4o", ' +
+      '"gemini-flash"] — pass two or more for a real contrast; unknown ids are ' +
+      'reported under `missing` instead of failing the call, and pricing is USD ' +
+      'per 1M tokens. Every row also carries `refCostUsd`, the price of a fixed ' +
+      '9000-in + 1000-out reference workload, which is what the winners and cost ' +
+      'ratios use, so models cannot be compared on raw per-token numbers alone. ' +
+      '`winners` names the best model per dimension (ties break on catalog ' +
+      'order).',
+    parameters: {
+      ids: { type: 'array', required: true, description: 'Model ids to compare (two or more for a real contrast).', items: { type: 'string' } },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true, description: 'Whether at least one requested id resolved.' },
+          found: {
+            type: 'array',
+            required: true,
+            description: 'Resolved rows, ascending by reference price.',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                id: { type: 'string', required: true, description: 'Catalog model id.' },
+                context: { type: 'integer', required: true, description: 'Context window in tokens.' },
+                costIn: { type: 'number', required: true, description: 'USD per 1M input tokens.' },
+                costOut: { type: 'number', required: true, description: 'USD per 1M output tokens.' },
+                refCostUsd: { type: 'number', required: true, description: `USD for the ${REF_TOKENS_IN} in + ${REF_TOKENS_OUT} out reference workload.` },
+                capabilities: { type: 'array', required: true, description: 'Capability tags of this model.', items: { type: 'string' } },
+              },
+            },
+          },
+          missing: { type: 'array', required: true, description: 'Requested ids that are not in the catalog.', items: { type: 'string' } },
+          winners: {
+            type: 'object',
+            required: true,
+            additionalProperties: false,
+            properties: {
+              lowestCost: { type: 'string', required: true, description: 'Cheapest on the reference workload; "" when nothing resolved.' },
+              longestContext: { type: 'string', required: true, description: 'Largest context window; "" when nothing resolved.' },
+              mostCapabilities: { type: 'string', required: true, description: 'Most capability tags; "" when nothing resolved.' },
+            },
+          },
+          deltas: { type: 'array', required: true, description: 'Cost and context ratio lines versus the cheapest and smallest resolved model; empty below two rows.', items: { type: 'string' } },
+          notes: { type: 'array', required: true, description: 'Advisories such as an under-sized comparison set.', items: { type: 'string' } },
+        },
+      },
+      render: (_args, value) => {
+        if (value.found.length === 0) {
+          return [{ type: 'text', text: `model_compare: nothing to compare — unknown id(s): ${value.missing.join(', ')}` }]
+        }
+        const lines = value.found.map(entry =>
+          `${entry.id}: ctx=${entry.context} in=$${entry.costIn}/M out=$${entry.costOut}/M ref=${usd(entry.refCostUsd)} [${entry.capabilities.join(', ')}]`)
+        const winners = `winners: cost=${value.winners.lowestCost || '—'} context=${value.winners.longestContext || '—'} capability=${value.winners.mostCapabilities || '—'}`
+        const parts = [...lines, winners, ...value.deltas.map(delta => `- ${delta}`)]
+        if (value.missing.length > 0) parts.push(`- missing: ${value.missing.join(', ')}`)
+        if (value.notes.length > 0) parts.push(`note: ${value.notes.join('; ')}`)
+        return [{ type: 'text', text: parts.join('\n') }]
+      },
+    },
+    isConcurrencySafe: () => true,
+    execute(args) {
+      const missing: string[] = []
+      const resolved: ModelEntry[] = []
+      for (const raw of args.ids) {
+        const model = findModel(raw)
+        if (model === undefined) {
+          if (!missing.includes(raw)) missing.push(raw)
+          continue
+        }
+        if (!resolved.some(entry => entry.id === model.id)) resolved.push(model)
+      }
+
+      // Scan in catalog order, never caller order, so tied winners are stable.
+      resolved.sort((a, b) => CATALOG_ORDER.get(a.id)! - CATALOG_ORDER.get(b.id)!)
+
+      const found = resolved.map(model => ({
+        id: model.id,
+        context: model.context,
+        costIn: model.costIn,
+        costOut: model.costOut,
+        refCostUsd: price(model, REF_TOKENS_IN, REF_TOKENS_OUT).total,
+        capabilities: [...model.capabilities],
+      }))
+      found.sort((a, b) => a.refCostUsd - b.refCostUsd || byIdAsc(a.id, b.id))
+
+      const notes: string[] = []
+      if (resolved.length === 0) notes.push('no requested id is in the catalog')
+      else if (resolved.length < 2) notes.push('pass at least two ids for a real contrast')
+      if (missing.length > 0) notes.push(`known ids: ${CATALOG_IDS.join(', ')}`)
+
+      // First match wins each dimension, and the scan follows catalog order, so
+      // ties resolve deterministically without a locale-dependent comparator.
+      let longestContext = ''
+      let bestCtx = -1
+      let mostCapabilities = ''
+      let bestCaps = -1
+      for (const model of resolved) {
+        if (model.context > bestCtx) {
+          bestCtx = model.context
+          longestContext = model.id
+        }
+        const size = model.capabilities.length
+        if (size > bestCaps) {
+          bestCaps = size
+          mostCapabilities = model.id
+        }
+      }
+
+      const deltas: string[] = []
+      if (found.length >= 2) {
+        const baseline = found[0]!
+        const smallestCtx = Math.min(...found.map(entry => entry.context))
+        for (const row of found.slice(1)) {
+          const relation = baseline.refCostUsd <= 0
+            ? row.refCostUsd <= 0 ? 'also free' : 'priced while the baseline is free'
+            : `${round(row.refCostUsd / baseline.refCostUsd, 2)}x the cost of ${baseline.id}`
+          deltas.push(`cost — ${row.id}: ${usd(row.refCostUsd)} vs ${usd(baseline.refCostUsd)} (${relation})`)
+        }
+        for (const row of found.filter(entry => entry.context > smallestCtx).sort((a, b) => b.context - a.context || byIdAsc(a.id, b.id))) {
+          deltas.push(`context — ${row.id}: ${round(row.context / smallestCtx, 2)}x the ${smallestCtx} token minimum`)
+        }
+      }
+
+      return Promise.resolve({
+        ok: found.length > 0,
+        found,
+        missing,
+        winners: { lowestCost: found.length > 0 ? found[0]!.id : '', longestContext, mostCapabilities },
+        deltas,
+        notes,
+      })
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'model_cost',
+    description:
+      'Price an explicit token budget on one catalog model. Parameters: id is the ' +
+      'catalog model (case/separator insensitive), tokensIn and tokensOut are the ' +
+      'token counts to bill. Catalog prices are USD per 1M tokens, so the result ' +
+      'is the exact USD cost of that workload, split into inputCostUsd / ' +
+      'outputCostUsd plus the total. The tool also says whether tokensIn fits the ' +
+      'model context window. Unknown ids and negative token counts return ' +
+      'ok=false with an explanatory `error` rather than throwing.',
+    parameters: {
+      id: { type: 'string', required: true, description: 'Catalog model id to price.' },
+      tokensIn: { type: 'number', required: true, description: 'Input tokens billed (prompt, including any cached prefix).' },
+      tokensOut: { type: 'number', required: true, description: 'Output tokens billed (completion).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true, description: 'Whether the model resolved and the token counts were usable.' },
+          id: { type: 'string', required: true, description: 'Resolved catalog id, or the raw id when unknown.' },
+          error: { type: 'string', required: true, description: 'Failure reason; empty when ok.' },
+          tokensIn: { type: 'integer', required: true, description: 'Input tokens billed (0 on failure).' },
+          tokensOut: { type: 'integer', required: true, description: 'Output tokens billed (0 on failure).' },
+          inputCostUsd: { type: 'number', required: true, description: 'USD for the input side.' },
+          outputCostUsd: { type: 'number', required: true, description: 'USD for the output side.' },
+          totalCostUsd: { type: 'number', required: true, description: 'inputCostUsd + outputCostUsd.' },
+          contextTokens: { type: 'integer', required: true, description: 'Model context window (0 when the id is unknown).' },
+          fitsInContext: { type: 'boolean', required: true, description: 'Whether tokensIn fits the context window.' },
+          notes: { type: 'array', required: true, description: 'Advisories such as truncation, free-tier pricing, or an over-long prompt.', items: { type: 'string' } },
+        },
+      },
+      render: (_args, value) => {
+        if (!value.ok) return [{ type: 'text', text: `model_cost failed: ${value.error}` }]
+        const lines = [
+          `${value.id}: ${usd(value.inputCostUsd)} in (${value.tokensIn} tok) + ${usd(value.outputCostUsd)} out (${value.tokensOut} tok) = ${usd(value.totalCostUsd)}`,
+          value.fitsInContext
+            ? `input fits the ${value.contextTokens} token context window`
+            : `input exceeds the ${value.contextTokens} token context window`,
+        ]
+        if (value.notes.length > 0) lines.push(`note: ${value.notes.join('; ')}`)
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    isConcurrencySafe: () => true,
+    execute(args) {
+      const model = findModel(args.id)
+      if (model === undefined) {
+        return Promise.resolve({
+          ok: false,
+          id: args.id,
+          error: `unknown model "${args.id}"; known ids: ${CATALOG_IDS.join(', ')}`,
+          tokensIn: 0,
+          tokensOut: 0,
+          inputCostUsd: 0,
+          outputCostUsd: 0,
+          totalCostUsd: 0,
+          contextTokens: 0,
+          fitsInContext: false,
+          notes: [],
+        })
+      }
+      if (args.tokensIn < 0 || args.tokensOut < 0) {
+        return Promise.resolve({
+          ok: false,
+          id: model.id,
+          error: `token counts must not be negative (got tokensIn=${args.tokensIn}, tokensOut=${args.tokensOut})`,
+          tokensIn: 0,
+          tokensOut: 0,
+          inputCostUsd: 0,
+          outputCostUsd: 0,
+          totalCostUsd: 0,
+          contextTokens: model.context,
+          fitsInContext: false,
+          notes: [],
+        })
+      }
+
+      const tokensIn = Math.floor(args.tokensIn)
+      const tokensOut = Math.floor(args.tokensOut)
+      const notes: string[] = []
+      if (tokensIn !== args.tokensIn) notes.push(`tokensIn truncated from ${args.tokensIn} to ${tokensIn}`)
+      if (tokensOut !== args.tokensOut) notes.push(`tokensOut truncated from ${args.tokensOut} to ${tokensOut}`)
+      if (model.costIn === 0 && model.costOut === 0) notes.push('self-hosted row: token prices are 0, so cost reflects hardware, not a meter')
+
+      const fitsInContext = tokensIn <= model.context
+      if (!fitsInContext) notes.push(`only ${model.context} input tokens fit; the total prices the whole request as given`)
+
+      const cost = price(model, tokensIn, tokensOut)
+      return Promise.resolve({
+        ok: true,
+        id: model.id,
+        error: '',
+        tokensIn,
+        tokensOut,
+        inputCostUsd: cost.input,
+        outputCostUsd: cost.output,
+        totalCostUsd: cost.total,
+        contextTokens: model.context,
+        fitsInContext,
+        notes,
+      })
+    },
+  }))
 }

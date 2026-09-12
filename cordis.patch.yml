@@ -1,5 +1,10 @@
+# dsh-model-router bundle layer: inserts the host tool plugin into a profile's
+# layer stack. Install with:
+#   npx -y @deepseek-ai/dsh plugin --profile web add @qingshanjiluo/dsh-model-router
 - insert:
     - id: model-router
-      name: dsh-model-router
+      name: '@qingshanjiluo/dsh-model-router'
       config:
-        enabled: true
+        maxResults: 5
+        defaultBudgetUsd: 0
+        preferLowCost: false
